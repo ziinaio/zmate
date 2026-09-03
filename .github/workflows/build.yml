@@ -12,6 +12,21 @@ permissions:
   contents: write  # Needed to create releases
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.2'
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+
   build:
     name: Build for ${{ matrix.goos }} ${{ matrix.goarch }}
     runs-on: ubuntu-latest
@@ -48,7 +63,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [test, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
 
@@ -66,4 +81,3 @@ jobs:
           files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

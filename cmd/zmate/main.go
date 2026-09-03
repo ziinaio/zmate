@@ -2,7 +2,12 @@ package zmate
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -12,8 +17,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -22,6 +27,7 @@ import (
 	"github.com/urfave/cli/v2"
 	sshcrypto "golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
 
@@ -35,7 +41,7 @@ const banner = `
 `
 
 const examples = `
-Invite peers in you LAN.
+Invite peers in your LAN.
 
 	zmate -l 192.168.1.2:2222
 
@@ -109,8 +115,11 @@ var App = &cli.App{
 		&cli.StringFlag{
 			Name:    "host-key",
 			Aliases: []string{"k"},
-			Usage:   "Path to the private key for SSH authentication.",
-			Value:   "ssh_host_rsa_key",
+			Usage:   "Path to the built-in SSH server's private host key.",
+		},
+		&cli.StringFlag{
+			Name:  "known-hosts",
+			Usage: "Path to the known_hosts file used to verify the entrypoint.",
 		},
 	},
 	Action: func(ctx *cli.Context) error {
@@ -118,21 +127,13 @@ var App = &cli.App{
 		xdgRuntimeDir = os.Getenv("XDG_RUNTIME_DIR")
 
 		// Separate out the port from the listen-address.
-		parts := strings.Split(ctx.String("listen"), ":")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid listen address: %s", ctx.String("listen"))
-		}
-
-		listenHost := parts[0]
-		if ctx.String("server") == "" && listenHost == "127.0.0.1" {
-			return fmt.Errorf("address for remote ssh server not provided consider adding one with -s <server-addr> or make it accessible on your local network with -l 0.0.0.0:2222")
-		}
-		portStr := parts[1]
-		port, err := strconv.Atoi(portStr)
+		listenHost, port, err := parseListenAddress(ctx.String("listen"))
 		if err != nil {
 			return err
 		}
-
+		if ctx.String("server") == "" && listenHost == "127.0.0.1" {
+			return fmt.Errorf("address for remote ssh server not provided consider adding one with -s <server-addr> or make it accessible on your local network with -l 0.0.0.0:2222")
+		}
 		// Determine username for SSH authentication.
 		username := ctx.String("user")
 		if username == "" {
@@ -163,33 +164,40 @@ var App = &cli.App{
 			sessionName = fmt.Sprintf("zmate-%s", sessionName)
 		}
 
-		// Generate a random username for full read-write access.
-		// Generate a random username for read-only access.
-		rwUser, err = randomString(7)
+		// Generate bearer tokens for full and read-only access.
+		rwUser, err = randomString(16)
 		if err != nil {
 			return err
 		}
 
 		// Generate a random username for read-only access.
-		roUser, err = randomString(7)
+		roUser, err = randomString(16)
 		if err != nil {
 			return err
 		}
 		roUser += "-ro"
 
+		hostKey, hostKeyPath, err := loadOrCreateHostKey(ctx.String("host-key"))
+		if err != nil {
+			return err
+		}
+		hostKeyAlias := hostKeyAlias(hostKey)
+
 		chGuard := make(chan struct{}, 2)
+		remotePort := port
 
 		// Start the remote port-forwarding tunnel if a server endpoint is specified.
 		server := ctx.String("server")
 		// Track which host to connect to for Zellij (server or local listener)
 		serverOrHost := server
 		if server != "" {
+			remotePortReady := make(chan int, 1)
 			go func() {
-				if err := runReverseTunnel(chGuard, listenHost, server, username, port); err != nil {
+				if err := runReverseTunnel(remotePortReady, listenHost, server, username, ctx.String("known-hosts"), port); err != nil {
 					log.Fatalf("SSH remote port-forwarding tunnel terminated: %s\n", err)
 				}
 			}()
-			<-chGuard
+			remotePort = <-remotePortReady
 		} else {
 			// Pure local mode; skip remote port forwarding
 			log.Println("Skipping remote port-forwarding (local-only mode)")
@@ -197,7 +205,7 @@ var App = &cli.App{
 
 		// Start the SSH server
 		go func() {
-			if err := runServer(chGuard, port, ctx.String("listen"), ctx.String("host-key"), server); err != nil {
+			if err := runServer(chGuard, port, remotePort, ctx.String("listen"), hostKey, hostKeyPath, hostKeyAlias, server); err != nil {
 				log.Fatalf("SSH server error: %v", err)
 			}
 		}()
@@ -207,8 +215,8 @@ var App = &cli.App{
 		fmt.Println("")
 		if server != "" {
 			fmt.Println("Join via:")
-			fmt.Printf("  ssh -p %d %s@%s  # read-write\n", port, rwUser, server)
-			fmt.Printf("  ssh -p %d %s@%s  # read-only\n", port, roUser, server)
+			fmt.Printf("  %s  # read-write\n", sshConnectionCommand(remotePort, rwUser, server, hostKeyAlias))
+			fmt.Printf("  %s  # read-only\n", sshConnectionCommand(remotePort, roUser, server, hostKeyAlias))
 		}
 		if listenHost != "127.0.0.1" {
 			displayHost := listenHost
@@ -216,8 +224,8 @@ var App = &cli.App{
 				displayHost = "<local-addr>"
 			}
 			fmt.Println("Join via:")
-			fmt.Printf("  ssh -p %d %s@%s  # read-write\n", port, rwUser, displayHost)
-			fmt.Printf("  ssh -p %d %s@%s  # read-only\n", port, roUser, displayHost)
+			fmt.Printf("  %s  # read-write\n", sshConnectionCommand(port, rwUser, displayHost, hostKeyAlias))
+			fmt.Printf("  %s  # read-only\n", sshConnectionCommand(port, roUser, displayHost, hostKeyAlias))
 		}
 
 		// Start the Zellij session over SSH
@@ -230,12 +238,24 @@ var App = &cli.App{
 		} else {
 			fmt.Println("\nPress Enter to continue...")
 			bufio.NewReader(os.Stdin).ReadBytes('\n')
-			return runZellij(serverOrHost, sessionName, port)
+			return runZellij(serverOrHost, sessionName, remotePort)
 		}
 	},
 }
 
-func runServer(chGuard chan struct{}, port int, listenAddr, hostKeyFile, entrypoint string) error {
+func parseListenAddress(address string) (string, int, error) {
+	host, portString, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid listen address %q: %w", address, err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("invalid port %q", portString)
+	}
+	return host, port, nil
+}
+
+func runServer(chGuard chan struct{}, localPort, advertisedPort int, listenAddr string, hostKey sshcrypto.Signer, hostKeyPath, hostKeyAlias, entrypoint string) error {
 	// Define the SSH server
 	server := &ssh.Server{
 		Addr: listenAddr,
@@ -262,11 +282,12 @@ func runServer(chGuard chan struct{}, port int, listenAddr, hostKeyFile, entrypo
 			}
 
 			// Set TERM environment variable
+			cmd.Env = os.Environ()
 			cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
 			cmd.Env = append(cmd.Env, fmt.Sprintf("SHELL=%s", os.Getenv("SHELL")))
 			cmd.Env = append(cmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", xdgRuntimeDir))
-			cmd.Env = append(cmd.Env, fmt.Sprintf("ZMATE_CONNECTION_INFO=%s", fmt.Sprintf("ssh -p %d %s@%s", port, rwUser, entrypoint)))
-			cmd.Env = append(cmd.Env, fmt.Sprintf("ZMATE_CONNECTION_INFO_RO=%s", fmt.Sprintf("ssh -p %d %s@%s", port, roUser, entrypoint)))
+			cmd.Env = append(cmd.Env, fmt.Sprintf("ZMATE_CONNECTION_INFO=%s", sshConnectionCommand(advertisedPort, rwUser, entrypoint, hostKeyAlias)))
+			cmd.Env = append(cmd.Env, fmt.Sprintf("ZMATE_CONNECTION_INFO_RO=%s", sshConnectionCommand(advertisedPort, roUser, entrypoint, hostKeyAlias)))
 
 			// Start Zellij in a new PTY
 			ptmx, err := pty.Start(cmd)
@@ -299,37 +320,83 @@ func runServer(chGuard chan struct{}, port int, listenAddr, hostKeyFile, entrypo
 		},
 	}
 
-	// Load the host key from a file using golang.org/x/crypto/ssh to parse
-	privateKeyPath := hostKeyFile
-	keyBytes, err := os.ReadFile(privateKeyPath)
-	if err == nil {
-		private, err := sshcrypto.ParsePrivateKey(keyBytes)
-		if err == nil {
-			server.AddHostKey(private)
-		}
-	}
-
-	go func() {
-		chGuard <- struct{}{}
-	}()
+	server.AddHostKey(hostKey)
+	log.Printf("Using SSH host key %s (%s)", hostKeyPath, sshcrypto.FingerprintSHA256(hostKey.PublicKey()))
 
 	log.Printf("Starting zmate server on %s...\n", listenAddr)
-	return server.ListenAndServe()
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	chGuard <- struct{}{}
+	return server.Serve(listener)
 }
 
-func runReverseTunnel(chGuard chan struct{}, bindAddr, remoteHost, username string, port int) error {
+func hostKeyAlias(signer sshcrypto.Signer) string {
+	digest := sha256.Sum256(signer.PublicKey().Marshal())
+	return "zmate-" + hex.EncodeToString(digest[:8])
+}
+
+func sshConnectionCommand(port int, username, host, alias string) string {
+	return fmt.Sprintf("ssh -oHostKeyAlias=%s -p%d %s@%s", alias, port, username, host)
+}
+
+func loadOrCreateHostKey(path string) (sshcrypto.Signer, string, error) {
+	if path == "" {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return nil, "", fmt.Errorf("find user config directory: %w", err)
+		}
+		path = filepath.Join(configDir, "zmate", "ssh_host_ed25519_key")
+	}
+
+	keyBytes, err := os.ReadFile(path)
+	if err == nil {
+		signer, err := sshcrypto.ParsePrivateKey(keyBytes)
+		if err != nil {
+			return nil, "", fmt.Errorf("parse SSH host key %q: %w", path, err)
+		}
+		return signer, path, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, "", fmt.Errorf("read SSH host key %q: %w", path, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, "", fmt.Errorf("create SSH host key directory: %w", err)
+	}
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, "", fmt.Errorf("generate SSH host key: %w", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode SSH host key: %w", err)
+	}
+	keyBytes = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, keyBytes, 0600); err != nil {
+		return nil, "", fmt.Errorf("write SSH host key %q: %w", path, err)
+	}
+	signer, err := sshcrypto.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse generated SSH host key: %w", err)
+	}
+	return signer, path, nil
+}
+
+func runReverseTunnel(remotePortReady chan<- int, bindAddr, remoteHost, username, knownHostsFile string, localPort int) error {
 	log.Println("Starting SSH reverse port-forwarding...")
 
 	// Connect to the running SSH agent
 	sshAgentSocket := os.Getenv("SSH_AUTH_SOCK")
 	if sshAgentSocket == "" {
-		log.Fatalf("SSH agent not found. Please ensure SSH agent is running and SSH_AUTH_SOCK is set.")
+		return fmt.Errorf("SSH agent not found: ensure SSH_AUTH_SOCK is set")
 	}
 
 	// Open the agent socket
 	agentConn, err := net.Dial("unix", sshAgentSocket)
 	if err != nil {
-		log.Fatalf("Failed to connect to SSH agent: %s", err)
+		return fmt.Errorf("connect to SSH agent: %w", err)
 	}
 	defer agentConn.Close()
 
@@ -337,39 +404,53 @@ func runReverseTunnel(chGuard chan struct{}, bindAddr, remoteHost, username stri
 	agentClient := sshagent.NewClient(agentConn)
 
 	// SSH client configuration
+	hostKeyCallback, err := knownHostsCallback(knownHostsFile)
+	if err != nil {
+		return err
+	}
 	config := &sshcrypto.ClientConfig{
 		User: username, // Replace with your SSH username
 		Auth: []sshcrypto.AuthMethod{
 			// Use the SSH agent to retrieve keys for authentication
 			sshcrypto.PublicKeysCallback(agentClient.Signers),
 		},
-		HostKeyCallback: sshcrypto.InsecureIgnoreHostKey(), // For development, replace with proper verification in production
+		HostKeyCallback: hostKeyCallback,
 	}
 
-	client, err := sshcrypto.Dial("tcp", fmt.Sprintf("%s:22", remoteHost), config)
+	remoteAddress := remoteHost
+	if _, _, err := net.SplitHostPort(remoteAddress); err != nil {
+		remoteAddress = net.JoinHostPort(remoteHost, "22")
+	}
+	client, err := sshcrypto.Dial("tcp", remoteAddress, config)
 	if err != nil {
 		return fmt.Errorf("failed to dial SSH server: %v", err)
 	}
 
 	// Request remote port forwarding
-	listener, err := client.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+	listener, err := client.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", localPort))
 	if err != nil {
-		return fmt.Errorf("failed to set up remote port forwarding: %v", err)
+		log.Printf("Remote port %d unavailable; requesting an automatically allocated port", localPort)
+		listener, err = client.Listen("tcp", "0.0.0.0:0")
+		if err != nil {
+			return fmt.Errorf("failed to set up remote port forwarding on port %d or an automatic port: %w", localPort, err)
+		}
 	}
+	remotePort := listener.Addr().(*net.TCPAddr).Port
 
-	log.Printf("Remote port forwarding established: %s:%d -> localhost:%d", remoteHost, port, port)
+	log.Printf("Remote port forwarding established: %s:%d -> localhost:%d", remoteHost, remotePort, localPort)
+	remotePortReady <- remotePort
 
 	// Handle incoming connections
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				log.Printf("Listener accept error: %v", err)
-				continue
+				log.Printf("Remote forwarding listener stopped: %v", err)
+				return
 			}
 
 			// Connect to the local SSH server
-			localConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", bindAddr, port))
+			localConn, err := net.Dial("tcp", net.JoinHostPort(bindAddr, strconv.Itoa(localPort)))
 			if err != nil {
 				log.Printf("Failed to connect to local service: %v", err)
 				conn.Close()
@@ -386,17 +467,27 @@ func runReverseTunnel(chGuard chan struct{}, bindAddr, remoteHost, username stri
 		}
 	}()
 
-	go func() {
-		chGuard <- struct{}{}
-	}()
-
 	// Wait for interrupt signal to gracefully shutdown
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
 	log.Println("Shutting down...")
+	return client.Close()
+}
 
-	return nil
+func knownHostsCallback(path string) (sshcrypto.HostKeyCallback, error) {
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("find home directory for known_hosts: %w", err)
+		}
+		path = filepath.Join(home, ".ssh", "known_hosts")
+	}
+	callback, err := knownhosts.New(path)
+	if err != nil {
+		return nil, fmt.Errorf("load known_hosts %q: %w", path, err)
+	}
+	return callback, nil
 }
 
 func runZellij(server, sessionName string, port int) error {

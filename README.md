@@ -63,20 +63,30 @@ sequenceDiagram
 Both, the remote port-forwarding and the builtin minimal SSH server, are initiated and terminated with zmate.
 While zmate is not running, no listening-port will be bound, neither on your server, nor locally.
 You can choose the port on which to bind when you start zmate; default is 2222.
+If that port is already occupied on the public SSH entrypoint, zmate asks the server to allocate a free remote port and prints that port in the connection commands.
 
-The builtin minimal SSH server implements authentication and authorization solely via the username.
-Connecting peers must know the correct username.
+The builtin minimal SSH server uses a randomly generated 16-character username as a short-lived bearer token.
+Anyone who learns a connection command can join with the access level encoded by that username, so treat read-write and read-only connection commands as secrets.
 Peers connecting with a wrong username are immediately disconnected.
+
+The connection to the public SSH entrypoint is verified against `~/.ssh/known_hosts` by default.
+Use `--known-hosts` to select a different file.
 
 By default, zmate will bind the builtin SSH server to `127.0.0.1:2222`.
 If you explicitly decide to bind it to `:2222`, you can make your Zellij session available on your LAN.
 Peers in your network can then connect to the high-port on your Zellij host, directly, effectively bypassing the round-trip through the tunnel.
 
-If you don't provide an SSH host-key, zmate will generate a random in-memory key, every time it starts.
+On first use, zmate generates an Ed25519 host key at `$XDG_CONFIG_HOME/zmate/ssh_host_ed25519_key` (normally `~/.config/zmate/ssh_host_ed25519_key`) and reuses it on subsequent runs.
+This gives peers a stable SSH identity for the forwarded endpoint.
+Use `--host-key` to select an existing key or a different persistent location.
+The host-key fingerprint is printed at startup so peers can verify it out of band.
+Generated connection commands use a key-specific `HostKeyAlias`.
+This prevents different zmate hosts using the same public relay address and port from colliding in a peer's `known_hosts`, while still rejecting a changed key for an identity seen before.
+OpenSSH will ask peers to accept the key the first time they connect to a particular zmate host.
 
 ## Installation
 
-### Prerequisits
+### Prerequisites
 
 You as the host:
 
@@ -110,22 +120,22 @@ NAME:
    ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝
 
 USAGE:
-   ziina [global options] command [command options]
+   zmate [global options]
 
 DESCRIPTION:
    
-   Invite peers in you LAN.
+   Invite peers in your LAN.
 
-     ziina -l 192.168.1.2:2222
+     zmate -l 192.168.1.2:2222
 
    Invite peers using **ssh.example.com** as entrypoint for your peers:
 
-     ziina -s ssh.example.com
+     zmate -s ssh.example.com
 
    Show connection info:
 
-       echo $ZIINA_CONNECTION_INFO
-       echo $ZIINA_CONNECTION_INFO_RO
+       echo $ZMATE_CONNECTION_INFO
+       echo $ZMATE_CONNECTION_INFO_RO
 
 
 COMMANDS:
@@ -135,7 +145,8 @@ GLOBAL OPTIONS:
    --listen value, -l value    Listen on this port. (default: "127.0.0.1:2222")
    --server value, -s value    The SSH server to use as endpoint.
    --user value, -u value      Username for SSH authentication.
-   --host-key value, -k value  Path to the private key for SSH authentication. (default: "ssh_host_rsa_key")
+   --host-key value, -k value  Path to the built-in SSH server's private host key.
+   --known-hosts value          Path to the known_hosts file used to verify the entrypoint.
    --help, -h                  show help
 ```
 
@@ -145,8 +156,7 @@ GLOBAL OPTIONS:
 zmate -s myserver
 ```
 
-This will generate a random 7 digit Zellij session-name.
-Use it as username when connecting as client.
+This generates a random Zellij session name and separate random usernames for read-write and read-only access.
 
 ### Peer
 

@@ -1,20 +1,20 @@
-# Contributing to Ziina
+# Contributing to zmate
 
-Thanks for your interest in contributing to Ziina 🎉
+Thanks for your interest in contributing to zmate 🎉
 We welcome all kinds of contributions — code, documentation, bug reports, feature requests, and more.
 
 ## 🚀 How to Contribute
 
 1. Fork the Repository
 
-Start by [forking the repository](https://github.com/ziinaio/ziina/fork).
+Start by [forking the repository](https://github.com/ziinaio/zmate/fork).
 This will create your own copy where you can make changes.
 
 2. Clone Your Fork
 
 ```
-git clone https://github.com/your-username/ziina.git
-cd ziina
+git clone https://github.com/your-username/zmate.git
+cd zmate
 ```
 
 3. Create a Branch
