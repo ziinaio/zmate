@@ -68,9 +68,6 @@ var (
 
 	// quickShareMode flags if zmate is running in quick-share mode
 	quickShareMode = false
-
-	// xdgRuntimeDir is needed for Zellij session discovery
-	xdgRuntimeDir = ""
 )
 
 // charset contains the list of available characters for random session-name generation.
@@ -123,9 +120,6 @@ var App = &cli.App{
 		},
 	},
 	Action: func(ctx *cli.Context) error {
-		// we need this for Zellij session discovery
-		xdgRuntimeDir = os.Getenv("XDG_RUNTIME_DIR")
-
 		// Separate out the port from the listen-address.
 		listenHost, port, err := parseListenAddress(ctx.String("listen"))
 		if err != nil {
@@ -285,7 +279,6 @@ func runServer(chGuard chan struct{}, localPort, advertisedPort int, listenAddr 
 			cmd.Env = os.Environ()
 			cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
 			cmd.Env = append(cmd.Env, fmt.Sprintf("SHELL=%s", os.Getenv("SHELL")))
-			cmd.Env = append(cmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", xdgRuntimeDir))
 			cmd.Env = append(cmd.Env, fmt.Sprintf("ZMATE_CONNECTION_INFO=%s", sshConnectionCommand(advertisedPort, rwUser, entrypoint, hostKeyAlias)))
 			cmd.Env = append(cmd.Env, fmt.Sprintf("ZMATE_CONNECTION_INFO_RO=%s", sshConnectionCommand(advertisedPort, roUser, entrypoint, hostKeyAlias)))
 

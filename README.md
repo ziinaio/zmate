@@ -98,6 +98,8 @@ Your peers:
 
 - a standard [OpenSSH](https://github.com/openssh/openssh-portable) client
 
+On macOS, zmate preserves `TMPDIR` and lets Zellij select its native socket directory; `XDG_RUNTIME_DIR` is not required.
+
 ### Install via Go
 
 ```
